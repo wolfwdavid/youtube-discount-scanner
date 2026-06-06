@@ -400,6 +400,136 @@ def extract_description(html_text):
     return ""
 
 
+def fetch_description(video_id, tries=3):
+    """Fetch a video's full description text server-side.
+
+    YouTube bot-blocks this server's IP for direct watch-page scraping, so we
+    route through Jina's reader proxy (r.jina.ai), which renders the page and
+    returns clean text including the full description. Retries because the
+    proxy is occasionally flaky / truncates on the first hit.
+    """
+    url = f"https://r.jina.ai/https://www.youtube.com/watch?v={video_id}"
+    best = ""
+    for _ in range(max(1, tries)):
+        try:
+            txt = http_get(url, timeout=35)
+        except Exception:
+            txt = ""
+        if txt and len(txt) > len(best):
+            best = txt
+        # good enough once we have a substantial body
+        if len(best) > 1500:
+            break
+    return best
+
+
+def cmd_scrape(args):
+    """Scrape a channel's (or all followed channels') latest videos on demand,
+    fetch descriptions, detect codes, and record any finds to codes.json.
+
+    usage: scrape [<channel_id|@handle|name|url>] [--limit N] [--days N]
+                  [--all] [--json]
+      no target / --all : scrape every followed channel
+      --limit N         : max videos per channel to fetch (default 5)
+      --days N          : only consider videos newer than N days (default 30)
+      --json            : print machine-readable JSON summary
+    """
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    limit = int(_arg(args, "--limit", "5"))
+    days = int(_arg(args, "--days", "30"))
+    scrape_all = "--all" in args
+    args = [a for a in args if a != "--all"]
+    targets = [a for a in args if not a.startswith("--")
+               and a not in (_arg(args, "--limit"), _arg(args, "--days"))]
+
+    s = load_state()
+    chans = []
+    if targets and not scrape_all:
+        for t in targets:
+            cid, nm = resolve_channel(t)
+            chans.append({"id": cid, "name": nm})
+    else:
+        chans = s.get("channels", [])
+
+    cutoff = time.time() - days * 86400
+    results = []
+    recorded = 0
+    for ch in chans:
+        try:
+            entries = parse_feed(ch["id"])
+        except Exception as e:
+            sys.stderr.write(f"feed error {ch.get('name', ch['id'])}: {e}\n")
+            continue
+        count = 0
+        for e in entries:
+            if count >= limit:
+                break
+            if e.get("published"):
+                try:
+                    pub = datetime.fromisoformat(e["published"].replace("Z", "+00:00")).timestamp()
+                    if pub < cutoff:
+                        continue
+                except Exception:
+                    pass
+            count += 1
+            desc = fetch_description(e["video_id"])
+            res = detect_codes(desc, e["title"])
+            exp_date, exp_text = detect_expiry(desc) if desc else (None, None)
+            item = {
+                "video_id": e["video_id"],
+                "title": e["title"],
+                "channel": ch.get("name", e.get("channel", "")),
+                "url": e["url"],
+                "published": e.get("published", ""),
+                "has_code": res["has_code"],
+                "codes": [c["code"] for c in res["codes"]],
+                "offers": res.get("offers", []),
+                "desc_len": len(desc),
+            }
+            results.append(item)
+            # record any codes found
+            if res["has_code"]:
+                store = load_codes()
+                existing = {(c.get("code"), c.get("video_id")): c for c in store["codes"]}
+                now = datetime.now(timezone.utc).isoformat()
+                for cobj in res["codes"]:
+                    key = (cobj["code"], e["video_id"])
+                    rec = existing.get(key, {})
+                    rec.update({
+                        "code": cobj["code"],
+                        "channel": ch.get("name", e.get("channel", "")),
+                        "video_id": e["video_id"],
+                        "title": e["title"],
+                        "url": e["url"],
+                        "context": cobj.get("context", rec.get("context", "")),
+                        "expires": exp_date if exp_date else rec.get("expires"),
+                        "expires_text": exp_text if exp_text else rec.get("expires_text"),
+                        "found_at": rec.get("found_at", now),
+                        "reminded": rec.get("reminded", False),
+                    })
+                    if key not in existing:
+                        store["codes"].append(rec)
+                        recorded += 1
+                    existing[key] = rec
+                save_codes(store)
+
+    summary = {
+        "scraped_videos": len(results),
+        "channels": len(chans),
+        "codes_recorded": recorded,
+        "videos": results,
+    }
+    if as_json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(f"Scraped {len(results)} videos across {len(chans)} channel(s); "
+              f"recorded {recorded} new code(s).")
+        for v in results:
+            tag = ("🎟️ " + ",".join(v["codes"])) if v["has_code"] else "—"
+            print(f"  [{tag}] {v['channel']}: {v['title'][:55]}")
+
+
 def cmd_parse_html(args):
     title = ""
     if "--title" in args:
@@ -544,6 +674,7 @@ CMDS = {
     "check": cmd_check, "detect": cmd_detect, "parse-html": cmd_parse_html,
     "seen-add": cmd_seen_add, "record": cmd_record,
     "list-codes": cmd_list_codes, "expiring": cmd_expiring,
+    "scrape": cmd_scrape,
 }
 
 
