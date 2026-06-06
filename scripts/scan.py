@@ -55,35 +55,76 @@ def http_get(url, timeout=20):
 
 
 # ---------------- channel resolution ----------------
+def search_channel(query):
+    """Resolve any YouTuber by name via YouTube search. Returns (cid, name) or None."""
+    import urllib.parse
+    q = urllib.parse.quote(query)
+    # sp=EgIQAg%3D%3D filters results to channels only
+    url = f"https://www.youtube.com/results?search_query={q}&sp=EgIQAg%253D%253D"
+    try:
+        page = http_get(url)
+    except Exception:
+        return None
+    # Find the first channelRenderer block: it has channelId + a title
+    m = re.search(r'"channelRenderer":\{"channelId":"(UC[0-9A-Za-z_-]{22})".*?"title":\{"simpleText":"([^"]+)"', page)
+    if m:
+        return m.group(1), html.unescape(m.group(2))
+    # Fallback: first channelId anywhere that also has a canonicalBaseUrl nearby
+    m = re.search(r'"channelId":"(UC[0-9A-Za-z_-]{22})"', page)
+    if m:
+        cid = m.group(1)
+        return cid, channel_name(cid)
+    return None
+
+
 def resolve_channel(token):
-    """Return (channel_id, name) from a channel URL, @handle, UC… id, or bare handle."""
+    """Return (channel_id, name) from a channel URL, @handle, UC… id, or any YouTuber name."""
     token = token.strip()
     # already a channel id
     m = re.search(r"(UC[0-9A-Za-z_-]{22})", token)
     if m:
         cid = m.group(1)
         return cid, channel_name(cid)
-    # build a URL to fetch
-    if token.startswith("http"):
-        url = token
-    elif token.startswith("@"):
-        url = f"https://www.youtube.com/{token}"
-    else:
-        url = f"https://www.youtube.com/@{token}"
-    page = http_get(url)
+    # URL or explicit @handle -> direct page
+    is_direct = token.startswith("http") or token.startswith("@")
+    if is_direct:
+        url = token if token.startswith("http") else f"https://www.youtube.com/{token}"
+        page = http_get(url)
+        cid = _extract_cid(page)
+        if cid:
+            nm = None
+            mn = re.search(r'<meta property="og:title" content="([^"]+)"', page)
+            if mn:
+                nm = html.unescape(mn.group(1))
+            return cid, nm or channel_name(cid)
+        raise SystemExit(f"Could not resolve channel id from: {token}")
+    # Bare text. If it's a single word, try it as a handle first (fast path).
+    if " " not in token:
+        try:
+            page = http_get(f"https://www.youtube.com/@{token}")
+            cid = _extract_cid(page)
+            if cid:
+                nm = None
+                mn = re.search(r'<meta property="og:title" content="([^"]+)"', page)
+                if mn:
+                    nm = html.unescape(mn.group(1))
+                return cid, nm or channel_name(cid)
+        except Exception:
+            pass
+    # Anything else (names with spaces, or handle miss): search YouTube.
+    res = search_channel(token)
+    if res:
+        return res
+    raise SystemExit(f"Could not find a YouTube channel for: {token}")
+
+
+def _extract_cid(page):
     m = (re.search(r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[0-9A-Za-z_-]{22})"', page)
          or re.search(r'"externalId":"(UC[0-9A-Za-z_-]{22})"', page)
          or re.search(r'<meta property="og:url" content="https://www\.youtube\.com/channel/(UC[0-9A-Za-z_-]{22})"', page)
          or re.search(r'"channelId":"(UC[0-9A-Za-z_-]{22})"', page)
          or re.search(r'channel/(UC[0-9A-Za-z_-]{22})', page))
-    if not m:
-        raise SystemExit(f"Could not resolve channel id from: {token}")
-    cid = m.group(1)
-    nm = None
-    mn = re.search(r'<meta property="og:title" content="([^"]+)"', page)
-    if mn:
-        nm = html.unescape(mn.group(1))
-    return cid, nm or channel_name(cid)
+    return m.group(1) if m else None
 
 
 def channel_name(cid):
